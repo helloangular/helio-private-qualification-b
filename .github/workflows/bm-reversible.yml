@@ -1,0 +1,117 @@
+# BlueMatrix acceptance fixture: a reversible, non-catalog service deploy.
+#
+# Forward run: build produces a synthetic artifact and its sha256 digest; production records one GitHub
+# deployment whose payload carries the digest, artifact URI, workflow revision and Helio ids (the
+# evidence Helio pins as a back-out target). Rollback run (deployment_only=true): no build; production
+# re-installs the pinned artifact_digest and records the deployment the same way. No real application
+# is deployed: the "artifact" is a JSON file, and Helio verifies the digest through its verification profile.
+name: bm-reversible
+run-name: ${{ inputs.helio_execution_id || github.run_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      helio_execution_id:
+        type: string
+        required: false
+        default: ''
+      helio_release_id:
+        type: string
+        required: false
+        default: ''
+      workflow_revision:
+        type: string
+        required: false
+        default: ''
+      release_version:
+        type: string
+        required: false
+        default: ''
+      environment:
+        type: string
+        required: false
+        default: bm-production
+      artifact_digest:
+        type: string
+        required: false
+        default: ''
+      deployment_only:
+        type: string
+        required: false
+        default: 'false'
+
+permissions:
+  contents: read
+  deployments: write
+
+concurrency:
+  group: bm-reversible-${{ inputs.helio_execution_id || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: ${{ inputs.deployment_only != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      artifact_digest: ${{ steps.artifact.outputs.digest }}
+    steps:
+      - name: Build the synthetic artifact
+        id: artifact
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ inputs.release_version }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os
+          body = json.dumps({"application": "bm-reversible", "version": os.environ["RELEASE_VERSION"],
+                             "commit": os.environ["GITHUB_SHA"]}, sort_keys=True).encode()
+          digest = "sha256:" + hashlib.sha256(body).hexdigest()
+          open(os.environ["GITHUB_OUTPUT"], "a").write(f"digest={digest}\n")
+          print("artifact", digest)
+          PY
+
+  production:
+    needs: build
+    if: ${{ always() && (needs.build.result == 'success' || (inputs.deployment_only == 'true' && needs.build.result == 'skipped')) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: bm-production
+    steps:
+      - name: Install the artifact and record deployment evidence
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPLOYMENT_ONLY: ${{ inputs.deployment_only }}
+          PINNED_DIGEST: ${{ inputs.artifact_digest }}
+          BUILT_DIGEST: ${{ needs.build.outputs.artifact_digest }}
+          HELIO_EXECUTION_ID: ${{ inputs.helio_execution_id }}
+          HELIO_RELEASE_ID: ${{ inputs.helio_release_id }}
+          WORKFLOW_REVISION: ${{ inputs.workflow_revision }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, re, uuid
+          rollback = os.environ["DEPLOYMENT_ONLY"] == "true"
+          digest = os.environ["PINNED_DIGEST"] if rollback else os.environ["BUILT_DIGEST"]
+          assert re.fullmatch(r"sha256:[0-9a-f]{64}", digest), "a sha256 artifact digest is required"
+          if os.environ["HELIO_EXECUTION_ID"]:
+              assert re.fullmatch(r"[A-Za-z0-9._:-]{1,200}", os.environ["HELIO_EXECUTION_ID"])
+              assert os.environ["WORKFLOW_REVISION"] == os.environ["GITHUB_SHA"], "workflow_revision must equal the executing commit"
+          if os.environ["HELIO_RELEASE_ID"]:
+              uuid.UUID(os.environ["HELIO_RELEASE_ID"])
+          payload = {"schema_version": 1, "helio_execution_id": os.environ["HELIO_EXECUTION_ID"],
+                     "artifact_digest": digest, "artifact_uri": "urn:bm-reversible@" + digest,
+                     "rollback_workflow_id": ".github/workflows/bm-reversible.yml",
+                     "workflow_revision": os.environ["WORKFLOW_REVISION"] or os.environ["GITHUB_SHA"]}
+          if os.environ["HELIO_RELEASE_ID"]:
+              payload["release_id"] = os.environ["HELIO_RELEASE_ID"]
+          json.dump({"ref": os.environ["GITHUB_SHA"], "auto_merge": False, "required_contexts": [],
+                     "environment": "bm-production", "task": "helio-rollback" if rollback else "helio-forward-release",
+                     "payload": payload}, open("deployment-evidence.json", "w"))
+          print("installing", digest, "rollback" if rollback else "forward")
+          PY
+          api="https://api.github.com/repos/$GITHUB_REPOSITORY"
+          deployment_id="$(curl -fsS -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "$api/deployments" --data @deployment-evidence.json | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')"
+          curl -fsS -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "$api/deployments/$deployment_id/statuses" --data '{"state":"success","description":"Synthetic artifact installed; digest recorded"}' > /dev/null
