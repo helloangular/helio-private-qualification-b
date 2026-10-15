@@ -1,0 +1,66 @@
+name: helio redeploy pipeline-3a3a6fb1-5002-4650-bcce-14533ba7eccd
+'on':
+  workflow_dispatch:
+    inputs:
+      helio_execution_id:
+        type: string
+        required: true
+      environments:
+        type: string
+        required: true
+        description: JSON list with exactly one manifest instance ID
+      artifact_uri:
+        type: string
+        required: true
+        description: Immutable artifact URI pinned to artifact_digest
+      artifact_digest:
+        type: string
+        required: true
+      workflow_revision:
+        type: string
+        required: true
+        description: Finalized execution commit; must equal the commit this run executes
+jobs:
+  plan:
+    runs-on:
+    - self-hosted
+    - helio-plan
+    outputs:
+      selected: ${{ steps.verify.outputs.selected }}
+    steps:
+    - uses: actions/checkout@v4
+    - id: verify
+      env:
+        HELIO_MODE: redeploy
+        HELIO_ENVIRONMENTS: ${{ inputs.environments }}
+        HELIO_ARTIFACT_URI: ${{ inputs.artifact_uri }}
+        HELIO_ARTIFACT_DIGEST: ${{ inputs.artifact_digest }}
+        HELIO_WORKFLOW_REVISION: ${{ inputs.workflow_revision }}
+        HELIO_MANIFEST: .helio/pipeline-3a3a6fb1-5002-4650-bcce-14533ba7eccd/environments.json
+        HELIO_ACTIVATION: .helio/pipeline-3a3a6fb1-5002-4650-bcce-14533ba7eccd/activation.json
+        HELIO_WORKFLOW: .github/workflows/helio-pipeline-3a3a6fb1-5002-4650-bcce-14533ba7eccd-redeploy.yml
+      run: node .helio/plan.cjs
+  deploy-prod_a:
+    needs:
+    - plan
+    if: ${{ !cancelled() && needs.plan.result == 'success' && contains(fromJSON(needs.plan.outputs.selected), 'prod_a') }}
+    uses: ./.github/workflows/helio-pipeline-3a3a6fb1-5002-4650-bcce-14533ba7eccd-deploy-one.yml
+    with:
+      env: prod_a
+      runs_on: '["ubuntu-latest"]'
+      artifact_digest: ${{ inputs.artifact_digest }}
+      artifact_uri: ${{ inputs.artifact_uri }}
+      mode: redeploy
+    secrets: inherit
+  deploy-prod_b:
+    needs:
+    - plan
+    if: ${{ !cancelled() && needs.plan.result == 'success' && contains(fromJSON(needs.plan.outputs.selected), 'prod_b') }}
+    uses: ./.github/workflows/helio-pipeline-3a3a6fb1-5002-4650-bcce-14533ba7eccd-deploy-one.yml
+    with:
+      env: prod_b
+      runs_on: '["ubuntu-latest"]'
+      artifact_digest: ${{ inputs.artifact_digest }}
+      artifact_uri: ${{ inputs.artifact_uri }}
+      mode: redeploy
+    secrets: inherit

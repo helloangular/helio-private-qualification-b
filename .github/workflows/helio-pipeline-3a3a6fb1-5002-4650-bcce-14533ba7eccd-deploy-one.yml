@@ -1,0 +1,33 @@
+name: helio deploy-one pipeline-3a3a6fb1-5002-4650-bcce-14533ba7eccd
+'on':
+  workflow_call:
+    inputs:
+      env:
+        type: string
+        required: true
+      runs_on:
+        type: string
+        required: true
+      artifact_digest:
+        type: string
+        required: true
+      artifact_uri:
+        type: string
+        required: false
+        default: ''
+      mode:
+        type: string
+        required: false
+        default: forward
+jobs:
+  deploy:
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    environment: ${{ inputs.env }}
+    steps:
+    - uses: actions/checkout@v4
+    - env:
+        HELIO_ENV: ${{ inputs.env }}
+        HELIO_ARTIFACT_DIGEST: ${{ inputs.artifact_digest }}
+        HELIO_ARTIFACT_URI: ${{ inputs.artifact_uri }}
+        HELIO_DEPLOY_MODE: ${{ inputs.mode }}
+      run: node .helio/deploy.cjs
