@@ -1,0 +1,198 @@
+# BlueMatrix follow-up fixture (fx stream, 15 Oct 2026): a reversible, provider-managed (single-run) workflow that deploys
+# one release to TWO production environment instances of an activated, signed Helio environment manifest (dynamic
+# environment fan-out): jobs deploy-prod_a and deploy-prod_b, environments prod_a and prod_b (provider-observed: a GitHub
+# required reviewer approves each). GitHub-hosted runners (never the shared self-hosted ones).
+#
+# Forward run: build -> deploy-prod_a / deploy-prod_b (each records one GitHub deployment carrying the managed evidence
+# contract: digest, URI, rollback workflow, workflow revision, release id) -> record (environment bm-fx-fo-production,
+# the logical environment's own binding; no deployment).
+# Rollback run (deployment_only=true, environment=<instance>): no build; only that instance re-installs artifact_digest.
+#
+# Variant by token in the release version (Helio passes it as release_version):
+#   -nob   deploy-prod_b succeeds WITHOUT recording deployment evidence (prod_b has no verified deployment while prod_a
+#          has one: the run's evidence for prod_b never appears and Helio holds the stage for the missing evidence)
+name: bm-fx-fanout
+run-name: ${{ inputs.helio_execution_id || github.run_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      helio_execution_id:
+        type: string
+        required: false
+        default: ''
+      helio_release_id:
+        type: string
+        required: false
+        default: ''
+      workflow_revision:
+        type: string
+        required: false
+        default: ''
+      release_version:
+        type: string
+        required: false
+        default: ''
+      environment:
+        type: string
+        required: false
+        default: ''
+      artifact_digest:
+        type: string
+        required: false
+        default: ''
+      deployment_only:
+        type: string
+        required: false
+        default: 'false'
+
+permissions:
+  contents: read
+  deployments: write
+  actions: read
+
+concurrency:
+  group: bm-fx-fanout-${{ inputs.helio_execution_id || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: ${{ inputs.deployment_only != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      artifact_digest: ${{ steps.artifact.outputs.digest }}
+    steps:
+      - name: Build the synthetic artifact
+        id: artifact
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ inputs.release_version }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os
+          body = json.dumps({"application": "bm-fx-fanout", "version": os.environ["RELEASE_VERSION"],
+                             "commit": os.environ["GITHUB_SHA"]}, sort_keys=True).encode()
+          digest = "sha256:" + hashlib.sha256(body).hexdigest()
+          open(os.environ["GITHUB_OUTPUT"], "a").write(f"digest={digest}\n")
+          print("artifact", digest)
+          PY
+
+  deploy-prod_a:
+    needs: build
+    if: ${{ always() && ((needs.build.result == 'success' && inputs.deployment_only != 'true') || (inputs.deployment_only == 'true' && inputs.environment == 'prod_a' && needs.build.result == 'skipped')) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: prod_a
+    steps:
+      - name: Install the artifact on prod_a and record deployment evidence (helio-forward-release / rollback_workflow_id)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INSTANCE: prod_a
+          JOB_NAME: deploy-prod_a
+          DEPLOYMENT_ONLY: ${{ inputs.deployment_only }}
+          PINNED_DIGEST: ${{ inputs.artifact_digest }}
+          BUILT_DIGEST: ${{ needs.build.outputs.artifact_digest }}
+          HELIO_EXECUTION_ID: ${{ inputs.helio_execution_id }}
+          HELIO_RELEASE_ID: ${{ inputs.helio_release_id }}
+          WORKFLOW_REVISION: ${{ inputs.workflow_revision }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, re, uuid, urllib.request
+          rollback = os.environ["DEPLOYMENT_ONLY"] == "true"
+          digest = os.environ["PINNED_DIGEST"] if rollback else os.environ["BUILT_DIGEST"]
+          assert re.fullmatch(r"sha256:[0-9a-f]{64}", digest), "a sha256 artifact digest is required"
+          if os.environ["HELIO_EXECUTION_ID"]:
+              assert re.fullmatch(r"[A-Za-z0-9._:-]{1,200}", os.environ["HELIO_EXECUTION_ID"])
+              assert os.environ["WORKFLOW_REVISION"] == os.environ["GITHUB_SHA"], "workflow_revision must equal the executing commit"
+          if os.environ["HELIO_RELEASE_ID"]:
+              uuid.UUID(os.environ["HELIO_RELEASE_ID"])
+          api = "https://api.github.com/repos/" + os.environ["GITHUB_REPOSITORY"]
+          hdr = {"Authorization": "Bearer " + os.environ["GH_TOKEN"], "Accept": "application/vnd.github+json"}
+          def call(method, url, body=None):
+              req = urllib.request.Request(url, method=method, data=None if body is None else json.dumps(body).encode(), headers=hdr)
+              with urllib.request.urlopen(req) as r: return json.load(r)
+          jobs = call("GET", f"{api}/actions/runs/{os.environ['GITHUB_RUN_ID']}/attempts/{os.environ['GITHUB_RUN_ATTEMPT']}/jobs?per_page=100")["jobs"]
+          job_url = next(j["html_url"] for j in jobs if j["name"] == os.environ["JOB_NAME"])
+          payload = {"schema_version": 1, "helio_execution_id": os.environ["HELIO_EXECUTION_ID"],
+                     "artifact_digest": digest, "artifact_uri": "urn:bm-fx-fanout@" + digest,
+                     "rollback_workflow_id": ".github/workflows/bm-fx-fanout.yml",
+                     "workflow_revision": os.environ["WORKFLOW_REVISION"] or os.environ["GITHUB_SHA"]}
+          if os.environ["HELIO_RELEASE_ID"]:
+              payload["release_id"] = os.environ["HELIO_RELEASE_ID"]
+          d = call("POST", f"{api}/deployments", {"ref": os.environ["GITHUB_SHA"], "auto_merge": False, "required_contexts": [],
+                                                   "environment": os.environ["INSTANCE"], "task": "helio-rollback" if rollback else "helio-forward-release",
+                                                   "payload": payload})
+          call("POST", f"{api}/deployments/{d['id']}/statuses", {"state": "success", "log_url": job_url,
+                                                                  "description": "Synthetic artifact installed; digest recorded"})
+          print("installed", digest, "rollback" if rollback else "forward", "on", os.environ["INSTANCE"], "deployment", d["id"])
+          PY
+
+  deploy-prod_b:
+    needs: build
+    if: ${{ always() && ((needs.build.result == 'success' && inputs.deployment_only != 'true') || (inputs.deployment_only == 'true' && inputs.environment == 'prod_b' && needs.build.result == 'skipped')) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: prod_b
+    steps:
+      - name: Install the artifact on prod_b and record deployment evidence (helio-forward-release / rollback_workflow_id)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INSTANCE: prod_b
+          JOB_NAME: deploy-prod_b
+          DEPLOYMENT_ONLY: ${{ inputs.deployment_only }}
+          PINNED_DIGEST: ${{ inputs.artifact_digest }}
+          BUILT_DIGEST: ${{ needs.build.outputs.artifact_digest }}
+          HELIO_EXECUTION_ID: ${{ inputs.helio_execution_id }}
+          HELIO_RELEASE_ID: ${{ inputs.helio_release_id }}
+          WORKFLOW_REVISION: ${{ inputs.workflow_revision }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+        run: |
+          set -euo pipefail
+          case "$RELEASE_VERSION" in *-nob*) echo "variant -nob: prod_b deployed WITHOUT recording deployment evidence"; exit 0 ;; esac
+          python3 - <<'PY'
+          import json, os, re, uuid, urllib.request
+          rollback = os.environ["DEPLOYMENT_ONLY"] == "true"
+          digest = os.environ["PINNED_DIGEST"] if rollback else os.environ["BUILT_DIGEST"]
+          assert re.fullmatch(r"sha256:[0-9a-f]{64}", digest), "a sha256 artifact digest is required"
+          if os.environ["HELIO_EXECUTION_ID"]:
+              assert re.fullmatch(r"[A-Za-z0-9._:-]{1,200}", os.environ["HELIO_EXECUTION_ID"])
+              assert os.environ["WORKFLOW_REVISION"] == os.environ["GITHUB_SHA"], "workflow_revision must equal the executing commit"
+          if os.environ["HELIO_RELEASE_ID"]:
+              uuid.UUID(os.environ["HELIO_RELEASE_ID"])
+          api = "https://api.github.com/repos/" + os.environ["GITHUB_REPOSITORY"]
+          hdr = {"Authorization": "Bearer " + os.environ["GH_TOKEN"], "Accept": "application/vnd.github+json"}
+          def call(method, url, body=None):
+              req = urllib.request.Request(url, method=method, data=None if body is None else json.dumps(body).encode(), headers=hdr)
+              with urllib.request.urlopen(req) as r: return json.load(r)
+          jobs = call("GET", f"{api}/actions/runs/{os.environ['GITHUB_RUN_ID']}/attempts/{os.environ['GITHUB_RUN_ATTEMPT']}/jobs?per_page=100")["jobs"]
+          job_url = next(j["html_url"] for j in jobs if j["name"] == os.environ["JOB_NAME"])
+          payload = {"schema_version": 1, "helio_execution_id": os.environ["HELIO_EXECUTION_ID"],
+                     "artifact_digest": digest, "artifact_uri": "urn:bm-fx-fanout@" + digest,
+                     "rollback_workflow_id": ".github/workflows/bm-fx-fanout.yml",
+                     "workflow_revision": os.environ["WORKFLOW_REVISION"] or os.environ["GITHUB_SHA"]}
+          if os.environ["HELIO_RELEASE_ID"]:
+              payload["release_id"] = os.environ["HELIO_RELEASE_ID"]
+          d = call("POST", f"{api}/deployments", {"ref": os.environ["GITHUB_SHA"], "auto_merge": False, "required_contexts": [],
+                                                   "environment": os.environ["INSTANCE"], "task": "helio-rollback" if rollback else "helio-forward-release",
+                                                   "payload": payload})
+          call("POST", f"{api}/deployments/{d['id']}/statuses", {"state": "success", "log_url": job_url,
+                                                                  "description": "Synthetic artifact installed; digest recorded"})
+          print("installed", digest, "rollback" if rollback else "forward", "on", os.environ["INSTANCE"], "deployment", d["id"])
+          PY
+
+  record:
+    needs: [deploy-prod_a, deploy-prod_b]
+    if: ${{ inputs.deployment_only != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: bm-fx-fo-production
+    steps:
+      - name: Record the fan-out result (no deployment)
+        shell: bash
+        run: echo "prod_a and prod_b deployed for ${GITHUB_SHA}"
