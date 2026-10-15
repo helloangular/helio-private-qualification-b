@@ -1,0 +1,64 @@
+name: helio deploy pipeline-3a3a6fb1-5002-4650-bcce-14533ba7eccd
+'on':
+  workflow_dispatch:
+    inputs:
+      helio_execution_id:
+        type: string
+        required: false
+      environments:
+        type: string
+        required: false
+        description: JSON list of instance IDs to deploy; must be a subset of the manifest closed under earlier tiers
+  push:
+    branches:
+    - main
+jobs:
+  plan:
+    runs-on:
+    - self-hosted
+    - helio-plan
+    outputs:
+      selected: ${{ steps.verify.outputs.selected }}
+    steps:
+    - uses: actions/checkout@v4
+    - id: verify
+      env:
+        HELIO_ENVIRONMENTS: ${{ inputs.environments }}
+        HELIO_MANIFEST: .helio/pipeline-3a3a6fb1-5002-4650-bcce-14533ba7eccd/environments.json
+        HELIO_ACTIVATION: .helio/pipeline-3a3a6fb1-5002-4650-bcce-14533ba7eccd/activation.json
+        HELIO_WORKFLOW: .github/workflows/helio-pipeline-3a3a6fb1-5002-4650-bcce-14533ba7eccd-deploy.yml
+      run: node .helio/plan.cjs
+  build:
+    needs:
+    - plan
+    runs-on:
+    - self-hosted
+    - helio-plan
+    outputs:
+      artifact_digest: ${{ steps.publish.outputs.artifact_digest }}
+    steps:
+    - uses: actions/checkout@v4
+    - id: publish
+      run: node .helio/build.cjs
+  deploy-prod_a:
+    needs:
+    - plan
+    - build
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.build.result == 'success' && contains(fromJSON(needs.plan.outputs.selected), 'prod_a') }}
+    uses: ./.github/workflows/helio-pipeline-3a3a6fb1-5002-4650-bcce-14533ba7eccd-deploy-one.yml
+    with:
+      env: prod_a
+      runs_on: '["ubuntu-latest"]'
+      artifact_digest: ${{ needs.build.outputs.artifact_digest }}
+    secrets: inherit
+  deploy-prod_b:
+    needs:
+    - plan
+    - build
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.build.result == 'success' && contains(fromJSON(needs.plan.outputs.selected), 'prod_b') }}
+    uses: ./.github/workflows/helio-pipeline-3a3a6fb1-5002-4650-bcce-14533ba7eccd-deploy-one.yml
+    with:
+      env: prod_b
+      runs_on: '["ubuntu-latest"]'
+      artifact_digest: ${{ needs.build.outputs.artifact_digest }}
+    secrets: inherit
